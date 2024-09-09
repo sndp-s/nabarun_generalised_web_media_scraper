@@ -25,8 +25,43 @@ Research Sites: https://arxiv.org
 Cross Polinated Social Network : https://new.reddit.com
 """
 
+import json
+from logging_config import get_logger
+
+
+logger = get_logger(__name__)
+
+
+def get_app_config():
+    """
+    Parses app config json file and returns python dict
+    """
+    logger.info("Reading app config")
+    with open("app_config.json", "r", encoding="utf-8") as config_file:
+        config = json.load(config_file)
+        return config
+
+
+def fetch_site(url):
+    pass
+
+
+def main():
+    """
+    App entry point
+    """
+    app_config = get_app_config()
+    sites_and_settings = app_config["sites_and_settings"]
+
+    for details in sites_and_settings:
+        url = details["url"]
+        scrape_media_types = details["scrape_media_types"]
+
+        # fetch site
+        site = fetch_site(url)
+
+        # parse the required media out of the fetched site data
+
 
 if __name__ == "__main__":
-    """
-    The entry point
-    """
+    main()

@@ -1,0 +1,26 @@
+{
+    "sites_and_settings": [
+        {
+            "url": "https://news.google.com",
+            "scrape_media_types": [
+                "IMAGES",
+                "TEXTS"
+            ]
+        },
+        {
+            "url": "https://arxiv.org",
+            "scrape_media_types": [
+                "IMAGES",
+                "VIDEOS",
+                "TEXTS",
+                "PDFS"
+            ]
+        },
+        {
+            "url": "https://new.reddit.com",
+            "scrape_media_types": [
+                "TEXTS"
+            ]
+        }
+    ]
+}
