@@ -2,24 +2,28 @@
     "sites_and_settings": [
         {
             "url": "https://news.google.com",
+            "type": "PAGE",
             "scrape_media_types": [
-                "IMAGES",
-                "TEXTS"
+                "IMAGE",
+                "TEXT"
             ]
         },
         {
             "url": "https://arxiv.org",
+            "type": "PAGE",
             "scrape_media_types": [
-                "IMAGES",
-                "VIDEOS",
-                "TEXTS",
-                "PDFS"
+                "IMAGE",
+                "VIDEO",
+                "TEXT",
+                "DOCUMENT",
+                "AUDIO"
             ]
         },
         {
             "url": "https://new.reddit.com",
+            "type": "PAGE",
             "scrape_media_types": [
-                "TEXTS"
+                "TEXT"
             ]
         }
     ]
