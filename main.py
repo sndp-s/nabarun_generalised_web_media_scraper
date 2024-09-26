@@ -208,9 +208,10 @@ class MediaScraper:
             {
                 "url": url,
                 "type": type,
+                "depth": depth,
                 **({"scrape_media_types": scrape_media_types} if type == "PAGE" else {})
             }
-            for (url, type) in urls_and_settings
+            for (url, type, depth) in urls_and_settings
         ], parsed_text
 
     async def save_file(self, content, filename, is_text=True):
