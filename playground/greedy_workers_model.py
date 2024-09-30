@@ -1,11 +1,12 @@
 import logging
 import asyncio
 import random
-
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 logging.basicConfig(
     level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='[%(asctime)s] [PID: %(process)d | Thread: %(thread)d] %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
         logging.FileHandler('greedy_workers_model.log', mode='w')
@@ -22,6 +23,8 @@ class Machine:
         self.queue = asyncio.Queue()
         self.max_workers = 5
         self.next_tasks = ['A', 'B', 'C', 'D', 'E']
+
+        self.shared_threadpool_executor = ThreadPoolExecutor(max_workers=5)
 
         logger.debug("Machine initialised")
 
@@ -42,6 +45,17 @@ class Machine:
 
         logger.debug("Work finished.")
 
+    def _simulate_sync_task(self):
+        logger.debug("Sync task started")
+        time.sleep(2)
+        logger.debug("Sync task finished")
+
+    async def simulate_sync_task(self):
+        logger.debug("Running sync task in threadpool")
+        asyncio.get_running_loop().run_in_executor(
+            self.shared_threadpool_executor, self._simulate_sync_task)
+        logger.debug("Finished running sync task in threadpool")
+
     async def worker(self, worker_id):
         logger.debug("Worker %s spawned", worker_id)
 
@@ -54,6 +68,9 @@ class Machine:
             # simulate async work done
             logger.debug("Simulating work in worker %s", worker_id)
             await self.simulate_async_work()
+
+            # simulate execution of a sync function in threadpool
+            await self.simulate_sync_task()
 
             # mark task completed
             logger.debug(
