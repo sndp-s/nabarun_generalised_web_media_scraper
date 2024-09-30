@@ -7,3 +7,4 @@ dev/
 config.json
 *.log
 downloads/
+.DS_Store
