@@ -32,6 +32,7 @@ import json
 import asyncio
 from datetime import datetime
 from urllib.parse import urljoin, urlparse, urlunparse
+from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 import aiohttp
 from logging_config import get_logger
@@ -52,16 +53,18 @@ class VisitedSites:
 
 
 class MediaScraper:
-    def __init__(self, max_workers=10, max_depth=3):
+    def __init__(self):
         """
         Initialize MediaScraper class, setting up logger and configuration.
         """
         self.logger = get_logger(__name__)
-        self.visited_sites = VisitedSites()
         self.app_config = self.get_app_config()
+        self.max_workers = self.app_config["max_workers"]
+        self.max_depth = self.app_config["max_depth"]
+        self.shared_executor = ThreadPoolExecutor(
+            max_workers=self.app_config["max_workers"])
         self.crawl_id = self.get_formatted_timestamp()
-        self.max_workers = max_workers  # TODO :: Pick this from config file
-        self.max_depth = max_depth  # TODO :: Pick this from config file
+        self.visited_sites = VisitedSites()
 
     def prepare_filename_for_url(self, url):
         # Normalize the URL by removing unsafe characters
@@ -134,18 +137,17 @@ class MediaScraper:
         # TODO :: Abort operation on too many failures
         # NOTE :: Should we maintain a status on each site_and_settings object? visited_sites is storing urls only not the whole thing... Lets see when the need arrives
         self.logger.info("Fetching %s", url)
-        response = await session.get(url)
-        content_type = response.headers.get("Content-Type", "").lower()
-        if 'text/html' in content_type or 'text/plain' in content_type:
-            self.logger.info("%s fetched", url)
-            return await response.text()
-        else:
-            self.logger.warning(
-                "NOT SUPPORTED :: Content-Type %s :: URL %s", content_type, url)
-            return None
+        async with session.get(url) as response:
+            content_type = response.headers.get("Content-Type", "").lower()
+            if 'text/html' in content_type or 'text/plain' in content_type:
+                self.logger.info("%s fetched", url)
+                return await response.text()
+            else:
+                self.logger.warning(
+                    "NOT SUPPORTED :: Content-Type %s :: URL %s", content_type, url)
+                return None
 
-    # TODO :: Use thread pool to make this non blocking
-    async def parse_html(self, html_content, base_url, scrape_media_types, depth):
+    async def _parse_html(self, html_content, base_url, scrape_media_types, depth):
         self.logger.info("Parsing html")
         soup = BeautifulSoup(html_content, 'html.parser')
         urls_and_settings = set()  # Use a set to avoid duplicate URLs
@@ -214,7 +216,12 @@ class MediaScraper:
             for (url, type, depth) in urls_and_settings
         ], parsed_text
 
-    async def save_file(self, content, filename, is_text=True):
+    async def parse_html(self, html_content, base_url, scrape_media_types, depth):
+        result = await asyncio.get_running_loop().run_in_executor(
+            self.shared_executor, self._parse_html, html_content, base_url, scrape_media_types, depth)
+        return result
+
+    def _save_file(self, content, filename, is_text):
         self.logger.info("Saving file %s", filename)
         base_directory = os.path.join("downloads", self.crawl_id)
         os.makedirs(base_directory, exist_ok=True)
@@ -228,95 +235,99 @@ class MediaScraper:
         with open(file_path, mode, encoding=encoding) as file:
             file.write(content)
 
-        print(f"{'Text' if is_text else 'Media'} content saved to {file_path}")
         self.logger.debug("File %s saved", file_path)
         return file_path
 
-    async def worker(self, worker_id, queue):
+    async def save_file(self, content, filename, is_text=True):
+        file_path = await asyncio.get_running_loop().run_in_executor(self.shared_executor, self._save_file, content, filename, is_text)
+        return file_path
+
+    async def worker(self, worker_id, queue, session):
         self.logger.info("Worker %s spawned", worker_id)
-        try:
-            while True:
-                # Obtain a new task
-                site_and_settings = await queue.get()
+        while True:
+            # Obtain a new task
+            site_and_settings = await queue.get()
 
-                self.logger.info("Worker %s picked task %s",
-                                 worker_id, site_and_settings)
+            self.logger.info("Worker %s picked task %s",
+                             worker_id, site_and_settings)
 
-                # Create a new client session
-                async with aiohttp.ClientSession() as session:
-                    url = site_and_settings["url"]
-                    url_type = site_and_settings["type"]
-                    depth = site_and_settings["depth"]
+            try:
+                url = site_and_settings["url"]
+                url_type = site_and_settings["type"]
+                depth = site_and_settings["depth"]
 
-                    # Ensure that the url is not already visited
-                    # NOTE :: We can do this check at the time of adding the url to the task queue itself
-                    if not await self.visited_sites.contains(url):
-                        await self.visited_sites.add(url)
+                # Ensure that the url is not already visited
+                # NOTE :: We can do this check at the time of adding the url to the task queue itself
+                if not await self.visited_sites.contains(url):
+                    await self.visited_sites.add(url)
 
-                        # NOTE :: This the url type can be inferred from the response content type
-                        if url_type == "PAGE":
-                            scrape_media_types = site_and_settings["scrape_media_types"]
+                    # NOTE :: This the url type can be inferred from the response content type
+                    if url_type == "PAGE":
+                        scrape_media_types = site_and_settings["scrape_media_types"]
 
-                            # Fetch the page
-                            html_content = await self.fetch_site_content(session, url)
-                            if html_content:
-                                # parse and extract the new urls contained in the site
-                                urls_and_settings, text = await self.parse_html(
-                                    html_content, url, scrape_media_types, depth)
+                        # Fetch the page
+                        html_content = await self.fetch_site_content(session, url)
+                        if html_content:
+                            # parse and extract the new urls contained in the site
+                            urls_and_settings, text = await self.parse_html(
+                                html_content, url, scrape_media_types, depth)
 
-                                # Add newly obtained links to the queue
-                                await self.bulk_add_items_to_queue(queue, urls_and_settings)
+                            # Add newly obtained links to the queue
+                            await self.bulk_add_items_to_queue(queue, urls_and_settings)
 
-                                # Dump the text content to a file
-                                await self.save_file(text, self.prepare_filename_for_url(url))
+                            # Dump the text content to a file
+                            await self.save_file(text, self.prepare_filename_for_url(url))
 
-                        elif url_type == "IMAGE":
-                            self.logger.debug(
-                                "%s download not supported yet", url_type)
+                    elif url_type == "IMAGE":
+                        self.logger.debug(
+                            "%s download not supported yet", url_type)
 
-                        elif url_type == "VIDEO":
-                            self.logger.debug(
-                                "%s download not supported yet", url_type)
+                    elif url_type == "VIDEO":
+                        self.logger.debug(
+                            "%s download not supported yet", url_type)
 
-                        elif url_type == "AUDIO":
-                            self.logger.debug(
-                                "%s download not supported yet", url_type)
+                    elif url_type == "AUDIO":
+                        self.logger.debug(
+                            "%s download not supported yet", url_type)
 
-                        elif url_type == "DOCUMENT":
-                            self.logger.debug(
-                                "%s download not supported yet", url_type)
+                    elif url_type == "DOCUMENT":
+                        self.logger.debug(
+                            "%s download not supported yet", url_type)
 
-                    self.logger.info("Task %s completed", site_and_settings)
+            except Exception as exc:
+                self.logger.exception("Worker exception")
 
+            finally:
                 queue.task_done()
-        except asyncio.CancelledError:
-            self.logger.warning("Worker %s cancelled", worker_id)
-        self.logger.warning("Worker %s execution completed", worker_id)
+
+            self.logger.info("Task %s completed", site_and_settings)
 
     async def run(self):
         """
         App entry point
         """
-        # Obtain seed sites and settings
-        sites_and_settings = self.app_config["sites_and_settings"]
+        # Obtain raw seed sites and settings and prep for task queue
+        sites_and_settings = [{"depth": 1, **site_and_settings, "url": self.sanitize_url(
+            site_and_settings["url"])} for site_and_settings in self.app_config["sites_and_settings"]]
 
         # Init a task queue
         queue = asyncio.Queue()
-        await self.bulk_add_items_to_queue(queue, [{"depth": 1, **site_and_settings, "url": self.sanitize_url(site_and_settings["url"])} for site_and_settings in sites_and_settings])
+        await self.bulk_add_items_to_queue(queue, sites_and_settings)
 
         # Create the workers
-        workers = [asyncio.create_task(self.worker(i, queue))
-                   for i in range(self.max_workers)]
+        async with aiohttp.ClientSession() as session:
+            workers = [asyncio.create_task(self.worker(i, queue, session))
+                       for i in range(self.max_workers)]
 
-        # Wait for all the tasks in the queue to be processed
-        await queue.join()
+            # Wait for all the tasks in the queue to be processed
+            await queue.join()
 
-        # Cancel the workers
-        for worker in workers:
-            worker.cancel()
+            # Cancel the workers
+            for worker in workers:
+                worker.cancel()
 
-        # Await clean cancellation
-        await asyncio.gather(*workers)
+            # Await clean cancellation
+            await asyncio.gather(*workers)
 
 
 if __name__ == "__main__":

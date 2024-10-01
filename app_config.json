@@ -26,5 +26,7 @@
                 "TEXT"
             ]
         }
-    ]
+    ],
+    "max_workers": 10,
+    "max_depth": 3
 }
