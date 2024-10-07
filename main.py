@@ -30,13 +30,23 @@ import re
 import json
 import asyncio
 import hashlib
+import logging
 from datetime import datetime
 from urllib.parse import urljoin, urlparse, urlunparse
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from bs4 import BeautifulSoup
 import aiohttp
-from logging_config import get_logger
 from constants import content_types_extensions_map
+
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('app.log', mode='w')
+    ]
+)
 
 
 class VisitedSites:
@@ -58,7 +68,7 @@ class MediaScraper:
         """
         Initialize MediaScraper class, setting up logger and configuration.
         """
-        self.logger = get_logger(__name__)
+        self.logger = logging.getLogger("CRAWLER")
         self.app_config = self.get_app_config()
         self.max_workers = self.app_config["max_workers"]
         self.max_depth = self.app_config["max_depth"]
