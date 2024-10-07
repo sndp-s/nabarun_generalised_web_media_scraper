@@ -25,17 +25,18 @@ Research Sites: https://arxiv.org
 Cross Polinated Social Network : https://new.reddit.com
 """
 
-
 import os
 import re
 import json
 import asyncio
+import hashlib
 from datetime import datetime
 from urllib.parse import urljoin, urlparse, urlunparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from bs4 import BeautifulSoup
 import aiohttp
 from logging_config import get_logger
+from constants import content_types_extensions_map
 
 
 class VisitedSites:
@@ -61,8 +62,10 @@ class MediaScraper:
         self.app_config = self.get_app_config()
         self.max_workers = self.app_config["max_workers"]
         self.max_depth = self.app_config["max_depth"]
-        self.shared_executor = ThreadPoolExecutor(
+        self.shared_threadpool_executor = ThreadPoolExecutor(
             max_workers=self.app_config["max_workers"])
+        # self.shared_processpool_executor = ProcessPoolExecutor(
+        #     max_workers=3)
         self.crawl_id = self.get_formatted_timestamp()
         self.visited_sites = VisitedSites()
 
@@ -78,6 +81,18 @@ class MediaScraper:
         filename = f"{normalized_name}_{timestamp}.txt"
 
         return filename
+
+    def hash_string(self, string):
+        # Encode the str to bytes
+        string_bytes = string.encode('utf-8')
+
+        # Create a SHA-256 hash object
+        hash_object = hashlib.sha256(string_bytes)
+
+        # Get the hexadecimal representation of the hash
+        hash_hex = hash_object.hexdigest()
+
+        return hash_hex
 
     def sanitize_url(self, url):
         # Parse the URL
@@ -127,7 +142,7 @@ class MediaScraper:
         for item in items:
             await queue.put(item)
 
-    async def fetch_site_content(self, session, url):
+    async def fetch_page(self, session, url):
         # Fetch the site
         # TODO :: Implement error handling
         # TODO :: Raise exception for status
@@ -138,19 +153,25 @@ class MediaScraper:
         # NOTE :: Should we maintain a status on each site_and_settings object? visited_sites is storing urls only not the whole thing... Lets see when the need arrives
         self.logger.info("Fetching %s", url)
         async with session.get(url) as response:
+            response.raise_for_status()
             content_type = response.headers.get("Content-Type", "").lower()
             if 'text/html' in content_type or 'text/plain' in content_type:
                 self.logger.info("%s fetched", url)
-                return await response.text()
+                return await response.text(), response.headers
             else:
                 self.logger.warning(
-                    "NOT SUPPORTED :: Content-Type %s :: URL %s", content_type, url)
-                return None
+                    "Unsupported Content-Type %s at URL %s", content_type, url)
+                return None, None
 
-    async def _parse_html(self, html_content, base_url, scrape_media_types, depth):
+    # async def _parse_html(self, html_content, base_url, scrape_media_types, depth, url_base_dir):
+    async def parse_html(self, html_content, base_url, scrape_media_types, depth, url_base_dir):
         self.logger.info("Parsing html")
+
+        # Parse the html content
         soup = BeautifulSoup(html_content, 'html.parser')
-        urls_and_settings = set()  # Use a set to avoid duplicate URLs
+
+        # Accumulate newly obtained urls
+        urls_and_settings = set()
 
         # Find all links in the HTML content
         for link in soup.find_all('a', href=True):
@@ -183,6 +204,8 @@ class MediaScraper:
                 img_url = img['src']
                 full_img_url = urljoin(base_url, img_url)
                 self.logger.info("New image url %s  found", full_img_url)
+                if await self.visited_sites.contains(full_img_url):
+                    continue
                 urls_and_settings.add((full_img_url, "IMAGE", depth))
 
         # Find all video sources
@@ -191,6 +214,8 @@ class MediaScraper:
                 video_url = video['src']
                 full_video_url = urljoin(base_url, video_url)
                 self.logger.info("New video url %s  found", full_video_url)
+                if await self.visited_sites.contains(full_video_url):
+                    continue
                 urls_and_settings.add((full_video_url, "VIDEO", depth))
 
         # Find all audio sources
@@ -199,10 +224,28 @@ class MediaScraper:
                 audio_url = audio['src']
                 full_audio_url = urljoin(base_url, audio_url)
                 self.logger.info("New audio url %s  found", full_audio_url)
+                if await self.visited_sites.contains(full_audio_url):
+                    continue
                 urls_and_settings.add((full_audio_url, "AUDIO", depth))
 
         # Extract text content from the HTML
         parsed_text = soup.get_text(separator='\n', strip=True)
+
+        # Extract metadata
+        metadata = {}
+        # Get the title of the page
+        title = soup.title.string if soup.title else 'No title'
+        metadata['title'] = title
+        # Extract meta tags
+        for meta in soup.find_all('meta'):
+            if 'name' in meta.attrs:
+                name = meta['name']
+                content = meta.get('content', '')
+                metadata[name] = content
+            elif 'property' in meta.attrs:  # For Open Graph tags
+                property_name = meta['property']
+                content = meta.get('content', '')
+                metadata[property_name] = content
 
         self.logger.info("HTML parsed")
 
@@ -211,25 +254,33 @@ class MediaScraper:
                 "url": url,
                 "type": type,
                 "depth": depth,
-                **({"scrape_media_types": scrape_media_types} if type == "PAGE" else {})
+                "url_base_dir": url_base_dir,
+                ** ({"scrape_media_types": scrape_media_types} if type == "PAGE" else {})
             }
             for (url, type, depth) in urls_and_settings
-        ], parsed_text
+        ], parsed_text, metadata
 
-    async def parse_html(self, html_content, base_url, scrape_media_types, depth):
-        result = await asyncio.get_running_loop().run_in_executor(
-            self.shared_executor, self._parse_html, html_content, base_url, scrape_media_types, depth)
-        return result
+    # async def parse_html(self, html_content, base_url, scrape_media_types, depth, url_base_dir):
+    #     result = await asyncio.get_running_loop().run_in_executor(
+    #         self.shared_threadpool_executor, self._parse_html, html_content, base_url, scrape_media_types, depth, url_base_dir)
+    #     return result
 
-    def _save_file(self, content, filename, is_text):
-        self.logger.info("Saving file %s", filename)
-        base_directory = os.path.join("downloads", self.crawl_id)
+    def _save_file(self, content, file_dir, filename, is_text):
+
+        # Prepare the file dir string (the dir in which file is stored)
+        base_directory = os.path.join("downloads", self.crawl_id, file_dir)
+
+        # Create the file dir if it does not already exists
         os.makedirs(base_directory, exist_ok=True)
+
+        # Prepare the file path string (file dir joined with file name)
         file_path = os.path.join(base_directory, filename)
 
         # Set the file open mode and encoding based on whether it's text or binary
         mode = 'w' if is_text else 'wb'
         encoding = 'utf-8' if is_text else None
+
+        self.logger.info("Saving file %s", file_path)
 
         # Open and write the content based on the type
         with open(file_path, mode, encoding=encoding) as file:
@@ -238,23 +289,94 @@ class MediaScraper:
         self.logger.debug("File %s saved", file_path)
         return file_path
 
-    async def save_file(self, content, filename, is_text=True):
-        file_path = await asyncio.get_running_loop().run_in_executor(self.shared_executor, self._save_file, content, filename, is_text)
+    async def save_file(self, content, file_dir, filename, is_text=True):
+        file_path = await asyncio.get_running_loop().run_in_executor(self.shared_threadpool_executor, self._save_file, content, file_dir, filename, is_text)
         return file_path
+
+    async def process_page_task(self, queue, session, site_and_settings):
+        # Extract site settings
+        url = site_and_settings["url"]
+        depth = site_and_settings["depth"]
+        scrape_media_types = site_and_settings["scrape_media_types"]
+        url_base_dir = site_and_settings.setdefault(
+            "url_base_dir", self.hash_string(url))
+
+        self.logger.info("Processing url: %s", url)
+
+        # Fetch the page
+        html_content, response_headers = await self.fetch_page(session, url)
+        if html_content:
+            # parse and extract the new urls contained in the site
+            urls_and_settings, extracted_text, metadata = await self.parse_html(
+                html_content, url, scrape_media_types, depth, url_base_dir)
+
+            # Add newly obtained links to the queue
+            await self.bulk_add_items_to_queue(queue, urls_and_settings)
+
+            # Save page metadata
+            metadata_json = json.dumps({"url": url, **metadata}, indent=4)
+            metadata_filename = f"{url_base_dir}.metadata.json"
+            await self.save_file(metadata_json, url_base_dir, metadata_filename)
+
+            # Save response headers
+            response_headers_json = json.dumps(
+                dict(response_headers), indent=4)
+            response_headers_filename = f"{url_base_dir}.responseHeaders.json"
+            await self.save_file(response_headers_json, url_base_dir, response_headers_filename)
+
+            # Save raw response content
+            raw_response_filename = f"{url_base_dir}.rawResponse.html"
+            await self.save_file(html_content, url_base_dir, raw_response_filename)
+
+            # Save the parsed text content to a file
+            extracted_text_filename = f"{url_base_dir}.parsed.txt"
+            await self.save_file(extracted_text, url_base_dir, extracted_text_filename)
+        else:
+            self.logger.debug("Unable to process %s", url)
+
+    async def process_media_task(self, session, site_and_settings):
+        url = site_and_settings["url"]
+
+        self.logger.info("Processing url: %s", url)
+
+        # Fetch the url
+        with session.get(url) as response:
+            content_type = response.headers.get("Content-Type", "").lower()
+            content_disposition = response.headers.get('Content-Disposition')
+
+            # Ensure we have valid content type response from the url
+            is_valid_media_content_type = content_type in content_types_extensions_map
+
+            # Validate that the response content type is in the valid media category
+            if is_valid_media_content_type:
+                url_base_dir = site_and_settings["url_base_dir"]
+                # Obtain/prepare the name of the file (hash of the url)
+                if content_disposition and 'filename=' in content_disposition:
+                    filename = content_disposition.split('filename=')[
+                        1].strip('"')
+                else:
+                    name = self.hash_string(url)
+                    # NOTE :: Figure this from content type header, in case even that does not work then leave it blank.
+                    ext = content_types_extensions_map[content_type]
+                    filename = name + ext
+
+                # Download item chunk by chunk and write to file
+                filepath = os.path.join(url_base_dir, "media", filename)
+                with open(filepath, "wb") as file:
+                    async for chunk in response.content.iter_chunked(1024 * 1000):
+                        if chunk:
+                            file.write(chunk)
 
     async def worker(self, worker_id, queue, session):
         self.logger.info("Worker %s spawned", worker_id)
         while True:
-            # Obtain a new task
-            site_and_settings = await queue.get()
-
-            self.logger.info("Worker %s picked task %s",
-                             worker_id, site_and_settings)
-
             try:
+                self.logger.debug("Worker %s Fetching new task", worker_id)
+                site_and_settings = await queue.get()
+                self.logger.info("Worker %s picked task %s",
+                                 worker_id, site_and_settings)
                 url = site_and_settings["url"]
                 url_type = site_and_settings["type"]
-                depth = site_and_settings["depth"]
 
                 # Ensure that the url is not already visited
                 # NOTE :: We can do this check at the time of adding the url to the task queue itself
@@ -263,36 +385,13 @@ class MediaScraper:
 
                     # NOTE :: This the url type can be inferred from the response content type
                     if url_type == "PAGE":
-                        scrape_media_types = site_and_settings["scrape_media_types"]
+                        await self.process_page_task(queue, session, site_and_settings)
 
-                        # Fetch the page
-                        html_content = await self.fetch_site_content(session, url)
-                        if html_content:
-                            # parse and extract the new urls contained in the site
-                            urls_and_settings, text = await self.parse_html(
-                                html_content, url, scrape_media_types, depth)
-
-                            # Add newly obtained links to the queue
-                            await self.bulk_add_items_to_queue(queue, urls_and_settings)
-
-                            # Dump the text content to a file
-                            await self.save_file(text, self.prepare_filename_for_url(url))
-
-                    elif url_type == "IMAGE":
-                        self.logger.debug(
-                            "%s download not supported yet", url_type)
-
-                    elif url_type == "VIDEO":
-                        self.logger.debug(
-                            "%s download not supported yet", url_type)
-
-                    elif url_type == "AUDIO":
-                        self.logger.debug(
-                            "%s download not supported yet", url_type)
-
-                    elif url_type == "DOCUMENT":
-                        self.logger.debug(
-                            "%s download not supported yet", url_type)
+                    elif url_type in ["IMAGE", "VIDEO", "AUDIO", "DOCUMENT"]:
+                        await self.process_media_task(session, site_and_settings)
+                else:
+                    self.logger.debug(
+                        "Skipping processing for site %s. Already processed.", url)
 
             except Exception as exc:
                 self.logger.exception("Worker exception")
@@ -300,7 +399,8 @@ class MediaScraper:
             finally:
                 queue.task_done()
 
-            self.logger.info("Task %s completed", site_and_settings)
+                self.logger.info("Task completed: %s",
+                                 site_and_settings)
 
     async def run(self):
         """
@@ -323,11 +423,15 @@ class MediaScraper:
             await queue.join()
 
             # Cancel the workers
+            self.logger.debug("Cancelling workers")
             for worker in workers:
                 worker.cancel()
 
             # Await clean cancellation
             await asyncio.gather(*workers)
+
+
+# NOTE :: scrape_media_types seems more appropriate at the top config level and not individual url level because of the ambiguitiy in assigning the same property to the children of any url (should the scrape_media_types of a url scraped from a page be same as that of the its parent? what about in the case of media types? (not relevant in that case)) - Tackle this after error handling & retrial and saving functionalities.
 
 
 if __name__ == "__main__":
