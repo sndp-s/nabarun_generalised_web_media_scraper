@@ -254,7 +254,7 @@ class MediaScraper:
                 "url": url,
                 "type": type,
                 "depth": depth,
-                "url_base_dir": url_base_dir,
+                "url_base_dir": url_base_dir if type != "PAGE" else self.hash_string(url),
                 ** ({"scrape_media_types": scrape_media_types} if type == "PAGE" else {})
             }
             for (url, type, depth) in urls_and_settings
@@ -339,8 +339,11 @@ class MediaScraper:
 
         self.logger.info("Processing url: %s", url)
 
+        # TODO :: Account for urls that are embedded file data themselves (starts with 'data:image/png...')
+        # TODO :: Add railguards to prevent request non http/s urls
+
         # Fetch the url
-        with session.get(url) as response:
+        async with session.get(url) as response:
             content_type = response.headers.get("Content-Type", "").lower()
             content_disposition = response.headers.get('Content-Disposition')
 
@@ -361,7 +364,10 @@ class MediaScraper:
                     filename = name + ext
 
                 # Download item chunk by chunk and write to file
-                filepath = os.path.join(url_base_dir, "media", filename)
+                file_dir = os.path.join(
+                    "downloads", self.crawl_id, url_base_dir, "media")
+                os.makedirs(file_dir, exist_ok=True)
+                filepath = os.path.join(file_dir, filename)
                 with open(filepath, "wb") as file:
                     async for chunk in response.content.iter_chunked(1024 * 1000):
                         if chunk:
