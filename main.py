@@ -31,6 +31,7 @@ import json
 import asyncio
 import hashlib
 import logging
+import time
 from datetime import datetime
 from urllib.parse import urljoin, urlparse, urlunparse
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
@@ -47,6 +48,14 @@ logging.basicConfig(
         logging.FileHandler('app.log', mode='w')
     ]
 )
+
+
+class TooManyErrors(Exception):
+    def __init__(self, message="Too many errors occurred."):
+        self.message = message
+        super().__init__(self.message)
+
+# NOTE :: Ensure that we need this. Lock isn't really required with coroutines but only threads are coroutines run only one at any given time.
 
 
 class VisitedSites:
@@ -70,14 +79,38 @@ class MediaScraper:
         """
         self.logger = logging.getLogger("CRAWLER")
         self.app_config = self.get_app_config()
-        self.max_workers = self.app_config["max_workers"]
-        self.max_depth = self.app_config["max_depth"]
+        self.max_workers = self.app_config.get("max_workers", 10)
+        self.max_depth = self.app_config.get("max_depth", 3)
+        self.max_retries = self.app_config.get("max_retries", 5)
         self.shared_threadpool_executor = ThreadPoolExecutor(
-            max_workers=self.app_config["max_workers"])
+            max_workers=self.app_config.get("max_workers", 10))
+        self.global_error_threshold = self.app_config.get(
+            "global_error_threshold", 50)
+        self.global_error_counter = {
+            "count": 0,
+            "last_reset_ts": int(time.time())
+        }
+        self.global_error_counter_reset_secs = self.app_config.get(
+            "global_error_counter_reset_secs", 900)  # 15 mins default
         # self.shared_processpool_executor = ProcessPoolExecutor(
         #     max_workers=3)
         self.crawl_id = self.get_formatted_timestamp()
         self.visited_sites = VisitedSites()
+        self.workers = []
+
+    def incr_global_error_count(self):
+        now_ts = int(time.time())
+        last_reset_ts = self.global_error_counter["last_reset_ts"]
+        secs_expend_since_last_reset = now_ts - last_reset_ts
+        if secs_expend_since_last_reset > self.global_error_counter_reset_secs:
+            self.global_error_counter["count"] = 1
+            self.global_error_counter["last_reset_ts"] = int(time.time())
+        else:
+            self.global_error_counter["count"] += 1
+
+        if self.global_error_counter["count"] > self.global_error_threshold:
+            raise TooManyErrors(
+                "Too many errors occured globally, please check the system")
 
     def prepare_filename_for_url(self, url):
         # Normalize the URL by removing unsafe characters
@@ -152,28 +185,39 @@ class MediaScraper:
         for item in items:
             await queue.put(item)
 
-    async def fetch_page(self, session, url):
+    async def fetch_page(self, session, url, attempt=1, delay=0):
         # Fetch the site
-        # TODO :: Implement error handling
-        # TODO :: Raise exception for status
-        # TODO :: Implement retrial on failure logic
-        # TODO :: Implement workaround for server throttling
-        # response code 429 - Too many requests, response code 503 - service temporarily unavailable
-        # TODO :: Abort operation on too many failures
-        # NOTE :: Should we maintain a status on each site_and_settings object? visited_sites is storing urls only not the whole thing... Lets see when the need arrives
-        self.logger.info("Fetching %s", url)
-        async with session.get(url) as response:
-            response.raise_for_status()
-            content_type = response.headers.get("Content-Type", "").lower()
-            if 'text/html' in content_type or 'text/plain' in content_type:
-                self.logger.info("%s fetched", url)
-                return await response.text(), response.headers
-            else:
-                self.logger.warning(
-                    "Unsupported Content-Type %s at URL %s", content_type, url)
-                return None, None
+        self.logger.info("Attempt %s | Fetching %s", attempt, url)
+        try:
+            async with session.get(url) as response:
+                # Too many requests / service temporarily unavailable
+                if response.status in (429, 503):
+                    err_msg = "Too many requests" if response.status == 429 else "Service temporarily unavailable"
+                    self.logger.error("%s | %s", err_msg, url)
+
+                    if attempt <= self.max_retries:  # Retry if attempts are left
+                        asyncio.sleep(delay or 1)  # Delay the retry
+                        return await self.fetch_page(session, url, attempt+1, delay*2)
+
+                    self.logger.error("Failed all attempts to fetch %s", url)
+                    return None, None
+
+                response.raise_for_status()
+
+                content_type = response.headers.get("Content-Type", "").lower()
+                if 'text/html' in content_type or 'text/plain' in content_type:
+                    self.logger.info("%s fetched", url)
+                    return await response.text(), response.headers
+                else:
+                    self.logger.warning(
+                        "Unsupported Content-Type %s at URL %s", content_type, url)
+                    return None, None
+        except aiohttp.ClientError:
+            self.logger.exception("Error fetching %s", url)
+            self.incr_global_error_count()
 
     # async def _parse_html(self, html_content, base_url, scrape_media_types, depth, url_base_dir):
+
     async def parse_html(self, html_content, base_url, scrape_media_types, depth, url_base_dir):
         self.logger.info("Parsing html")
 
@@ -349,8 +393,9 @@ class MediaScraper:
 
         self.logger.info("Processing url: %s", url)
 
+        # TODO :: Implement error handling
         # TODO :: Account for urls that are embedded file data themselves (starts with 'data:image/png...')
-        # TODO :: Add railguards to prevent request non http/s urls
+        # TODO :: Add railguards to avoid non http/s urls
 
         # Fetch the url
         async with session.get(url) as response:
@@ -409,6 +454,10 @@ class MediaScraper:
                     self.logger.debug(
                         "Skipping processing for site %s. Already processed.", url)
 
+            except TooManyErrors as exc:
+                self.logger.error("Shutting down, %s", exc)
+                self.cancel_workers()
+
             except Exception as exc:
                 self.logger.exception("Worker exception")
 
@@ -417,6 +466,15 @@ class MediaScraper:
 
                 self.logger.info("Task completed: %s",
                                  site_and_settings)
+
+    async def cancel_workers(self):
+        self.logger.debug("Cancelling workers")
+
+        for worker in self.workers:
+            worker.cancel()
+
+        # Await clean cancellation
+        await asyncio.gather(*self.workers)
 
     async def run(self):
         """
@@ -432,19 +490,14 @@ class MediaScraper:
 
         # Create the workers
         async with aiohttp.ClientSession() as session:
-            workers = [asyncio.create_task(self.worker(i, queue, session))
-                       for i in range(self.max_workers)]
+            self.workers = [asyncio.create_task(self.worker(i, queue, session))
+                            for i in range(self.max_workers)]
 
             # Wait for all the tasks in the queue to be processed
             await queue.join()
 
             # Cancel the workers
-            self.logger.debug("Cancelling workers")
-            for worker in workers:
-                worker.cancel()
-
-            # Await clean cancellation
-            await asyncio.gather(*workers)
+            await self.cancel_workers()
 
 
 # NOTE :: scrape_media_types seems more appropriate at the top config level and not individual url level because of the ambiguitiy in assigning the same property to the children of any url (should the scrape_media_types of a url scraped from a page be same as that of the its parent? what about in the case of media types? (not relevant in that case)) - Tackle this after error handling & retrial and saving functionalities.
